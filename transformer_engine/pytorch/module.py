@@ -38,6 +38,7 @@ from .fp8 import (
     copy_forward_fp8_meta_tensors_for_recompute,
     get_old_fp8_meta_tensors_for_recompute,
     restore_fp8_meta_tensors,
+    fused_amax_and_scale_update_debug
 )
 from .jit import (
     bias_gelu_fused,
@@ -273,7 +274,6 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
                 and getattr(self, weight_cast_attr).shape == shape
             ):
                 return
-
             setattr(
                 self,
                 weight_cast_attr,
@@ -1687,7 +1687,9 @@ class _LayerNormMLP(torch.autograd.Function):
         assert inp.shape[-1] == in_features, "GEMM not possible"
         inputmat = inp.view((-1, in_features))
 
-        update_fp8_weights = is_first_microbatch is None or is_first_microbatch
+        update_fp8_weights = (is_first_microbatch is None or is_first_microbatch) and \
+            (fc1_weight is not None and fc2_weight is not None) 
+
         # Cast for native AMP
         inputmat = cast_if_needed(inputmat, activation_dtype)
         ln_weight = cast_if_needed(ln_weight, activation_dtype)
@@ -2246,8 +2248,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
                      used for forward propogation and activation recompute phase.
     """
 
-    __fc1_weight = None;
-
     def __init__(
         self,
         hidden_size: int,
@@ -2324,7 +2324,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
             )
         )
 
-        self.fp8_weight_shapes.append(hidden_size)
+        self.fp8_weight_shapes.append(self.fc1_weight.shape)
 
         initialize_affine_weight_gpu(
             self.fc1_weight,
@@ -2394,6 +2394,48 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 )
 
     def deallocate_weights(self) -> None:
+        self.fp8_init(num_gemms=2)
+        assert self.fp8
+
+        amax_his = torch.tensor(
+            [[0, torch.amax(self.fc1_weight), 0, torch.amax(self.fc2_weight)]],
+            dtype=torch.float32,
+            device=torch.cuda.current_device()
+        )
+        scale = torch.ones(
+            4, dtype=torch.float32, device="cuda"
+        )
+
+        amax, sf = fused_amax_and_scale_update_debug(
+            amax_his,
+            scale,
+            self.fp8_meta["recipe"].fp8_format.value.max_fwd,
+            self.fp8_meta["recipe"].margin,
+            self.fp8_meta["recipe"].amax_compute_algo,
+        )
+
+        self.set_fp8_weights()
+        fp8_dtype_forward = get_fp8_te_dtype(self.fp8_meta["recipe"], fprop_tensor=True)
+
+        tex.fused_cast_transpose(
+            self.fc1_weight,
+            sf[tex.FP8FwdTensors.GEMM1_WEIGHT],
+            amax_his[0][tex.FP8FwdTensors.GEMM1_WEIGHT],
+            sf[tex.FP8FwdTensors.GEMM1_WEIGHT],
+            self.weight1_fp8,
+            self.weight1_t_fp8,
+            fp8_dtype_forward,
+        )
+
+        tex.fused_cast_transpose(
+            self.fc2_weight,
+            sf[tex.FP8FwdTensors.GEMM2_WEIGHT],
+            amax_his[0][tex.FP8FwdTensors.GEMM2_WEIGHT],
+            sf[tex.FP8FwdTensors.GEMM2_WEIGHT],
+            self.weight2_fp8,
+            self.weight2_t_fp8,
+            fp8_dtype_forward,
+        )
         self.fc1_weight = None
         self.fc2_weight = None
 

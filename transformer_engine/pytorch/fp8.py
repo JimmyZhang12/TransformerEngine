@@ -362,7 +362,6 @@ def fused_amax_and_scale_update(
         amax_history,
         amax_compute_algo,
     )
-
     # Calculate new scaling factor.
     return amax_history, _default_sf_compute(
         amax,
@@ -370,6 +369,29 @@ def fused_amax_and_scale_update(
         fp8_max,
         margin,
     )
+
+def fused_amax_and_scale_update_debug(
+    amax_history: torch.Tensor,
+    scale: torch.Tensor,
+    fp8_max: float,
+    margin: int,
+    amax_compute_algo: str,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Amax to scale conversion."""
+
+    # Get amax from history.
+    amax_history, amax = _default_get_amax(
+        amax_history,
+        amax_compute_algo,
+    )
+    sf = _default_sf_compute(
+        amax,
+        scale,
+        fp8_max,
+        margin,
+    )
+    # Calculate new scaling factor.
+    return amax_history, sf
 
 
 def _compute_amax(
