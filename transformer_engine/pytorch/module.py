@@ -570,8 +570,8 @@ class _LayerNormLinear(torch.autograd.Function):
         assert inp.shape[-1] == in_features, "GEMM not possible"
         inputmat = inp.view((-1, in_features))
 
-        update_fp8_weights = (is_first_microbatch is None or is_first_microbatch) \
-            and weight is not None 
+        is_first_microbatch = is_first_microbatch and weight is not None
+        update_fp8_weights = (is_first_microbatch is None or is_first_microbatch)
 
         # Cast for native AMP
         inputmat = cast_if_needed(inputmat, activation_dtype)
@@ -1194,8 +1194,8 @@ class _Linear(torch.autograd.Function):
         assert inp.shape[-1] == in_features, "GEMM not possible"
         inputmat = inp.view((-1, in_features))
 
-        update_fp8_weights = (is_first_microbatch is None or is_first_microbatch) \
-            and weight is not None
+        is_first_microbatch = is_first_microbatch and weight is not None
+        update_fp8_weights = (is_first_microbatch is None or is_first_microbatch)
 
         # Cast for native AMP
         inputmat = cast_if_needed(inputmat, activation_dtype)
@@ -1753,8 +1753,8 @@ class _LayerNormMLP(torch.autograd.Function):
         assert inp.shape[-1] == in_features, "GEMM not possible"
         inputmat = inp.view((-1, in_features))
 
-        update_fp8_weights = (is_first_microbatch is None or is_first_microbatch) and \
-            (fc1_weight is not None and fc2_weight is not None) 
+        is_first_microbatch = is_first_microbatch and (fc1_weight is not None and fc2_weight is not None) 
+        update_fp8_weights = is_first_microbatch is None or is_first_microbatch
 
         # Cast for native AMP
         inputmat = cast_if_needed(inputmat, activation_dtype)
