@@ -346,6 +346,43 @@ def _default_sf_compute(
 
     return sf
 
+def _default_sf_compute_gemm_input_only_inner(
+    amax: torch.Tensor,
+    scale: torch.Tensor,
+    fp8_max: float,
+    margin: int,
+) -> torch.Tensor:
+    
+    exp = torch.floor(torch.log2(fp8_max / amax)) - margin
+    sf = torch.round(torch.pow(2, torch.abs(exp)))
+    sf = torch.where(amax > 0.0, sf, scale)
+    sf = torch.where(torch.isfinite(amax), sf, scale)
+    sf = torch.where(exp < 0, 1 / sf, sf)
+
+    print(scale)
+    print(sf)
+    sf = torch.stack((sf[::2],scale[1::2]), dim=1).view(1,sf.shape[0])
+    print(sf)
+    input()
+    return sf
+
+# def _default_sf_compute_gemm_input_only(
+#     amax: torch.Tensor,
+#     scale: torch.Tensor,
+#     fp8_max: float,
+#     recipe: DelayedScaling,
+# ) -> torch.Tensor:
+
+#     margin = recipe.margin
+#     sf = _default_sf_compute_gemm_input_only_inner(
+#         amax,
+#         scale,
+#         fp8_max,
+#         margin,
+#     )
+
+#     return sf
+
 
 @torch.jit.script
 def fused_amax_and_scale_update(
@@ -369,30 +406,6 @@ def fused_amax_and_scale_update(
         fp8_max,
         margin,
     )
-
-def fused_amax_and_scale_update_debug(
-    amax_history: torch.Tensor,
-    scale: torch.Tensor,
-    fp8_max: float,
-    margin: int,
-    amax_compute_algo: str,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Amax to scale conversion."""
-
-    # Get amax from history.
-    amax_history, amax = _default_get_amax(
-        amax_history,
-        amax_compute_algo,
-    )
-    sf = _default_sf_compute(
-        amax,
-        scale,
-        fp8_max,
-        margin,
-    )
-    # Calculate new scaling factor.
-    return amax_history, sf
-
 
 def _compute_amax(
     amax_history: torch.Tensor,
@@ -437,7 +450,6 @@ def amax_and_scale_update(
     sf_compute = fp8_meta["recipe"].scaling_factor_compute_algo
     fp8_meta_tensor_key = "scaling_fwd" if fwd_update else "scaling_bwd"
     fp8_max_key = "fp8_max_fwd" if fwd_update else "fp8_max_bwd"
-
     if not callable(amax_compute) and sf_compute is None:
         (
             fp8_meta[fp8_meta_tensor_key].amax_history,

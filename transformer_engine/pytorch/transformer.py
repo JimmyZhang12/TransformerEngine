@@ -959,8 +959,13 @@ class TransformerLayer(torch.nn.Module):
             if hasattr(child, "set_tensor_parallel_group"):
                 child.set_tensor_parallel_group(tp_group)
 
-    def deallocate_weights(self) -> None:
-        self.layernorm_mlp.deallocate_weights()
+    def deallocate_and_cast_weights(self) -> None:
+        def fn(m):
+            if hasattr(m,"deallocate_weights"):
+                print(m)
+                m.deallocate_weights()
+        self.apply(fn)
+
 
     def forward(
         self,
