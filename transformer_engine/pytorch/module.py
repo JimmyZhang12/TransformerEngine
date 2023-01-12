@@ -337,7 +337,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
         self.set_activation_dtype(inp)
         self.fp8_init(num_gemms=num_gemms)
-        self.set_fp8_weights()
+        # self.set_fp8_weights()
 
         # Previous iteration was grad_enabled
         if self.fp8_meta.get("update_amax_and_scale_fwd", False):
@@ -683,13 +683,16 @@ class _LayerNormLinear(torch.autograd.Function):
         ctx.parallel_mode = parallel_mode
         ctx.tp_group = tp_group
         ctx.return_layernorm_output = return_layernorm_output
+        print("**")
 
+        print(out.shape)
         # Row Parallel Linear
         if parallel_mode == "row" and sequence_parallel:
             out, _ = reduce_scatter_along_first_dim(out, tp_group)
         elif parallel_mode == "row" and tensor_parallel:
             out, _ = allreduce(out, tp_group)
-
+        print(out.shape)
+        print("**")
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
         out = out.view(-1, *inp.shape[1:-1], out.shape[-1])
 
@@ -1009,14 +1012,14 @@ class LayerNormLinear(TransformerEngineBaseModule):
         self.reset_layer_norm_parameters()
 
         if not skip_weight_param_allocation:
-            self.weight = Parameter(
+            self.weight = \
                 torch.empty(
                     self.out_features,
                     self.in_features,
                     device=torch.cuda.current_device(),
                     dtype=params_dtype,
                 )
-            )
+            
 
             initialize_affine_weight_gpu(
                 self.weight,
@@ -1053,8 +1056,7 @@ class LayerNormLinear(TransformerEngineBaseModule):
             self.gemm_bias_unfused_add = False
 
     def deallocate_weights(self) -> None:
-        if type(self.weight) is not Parameter:
-            return
+
 
         self.fp8_init(num_gemms=1)
         assert self.fp8
@@ -1123,8 +1125,6 @@ class LayerNormLinear(TransformerEngineBaseModule):
 
         bias_tensor = bias if bias is not None else self.bias
 
-        # print(weight if weight is not None else self.weight)
-        # print(inp)
 
         out = _LayerNormLinear.apply(
             inp,
@@ -1190,7 +1190,11 @@ class _Linear(torch.autograd.Function):
         parallel_mode: Union[str, None],
     ) -> torch.Tensor:
         # Make sure input dimensions are compatible
-        in_features = weight_fp8.shape[-1]
+        if weight is None:
+            in_features = weight_fp8.shape[-1]
+        else:
+            in_features = weight.shape[-1]
+
         assert inp.shape[-1] == in_features, "GEMM not possible"
         inputmat = inp.view((-1, in_features))
 
@@ -1277,8 +1281,6 @@ class _Linear(torch.autograd.Function):
                 use_bias=use_bias,
             )
 
-        # print(out)
-        # input()
 
         ctx.save_for_backward(
             inputmat_no_fp8 
@@ -1580,14 +1582,13 @@ class Linear(TransformerEngineBaseModule):
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
 
         if not skip_weight_param_allocation:
-            self.weight = Parameter(
-                torch.empty(
+            self.weight = torch.empty(
                     self.out_features,
                     self.in_features,
                     device=torch.cuda.current_device(),
-                    dtype=params_dtype,
-                )
-            )
+                    dtype=params_dtype,)
+                
+            
 
             initialize_affine_weight_gpu(
                 self.weight,
@@ -1624,8 +1625,6 @@ class Linear(TransformerEngineBaseModule):
             self.gemm_bias_unfused_add = False
 
     def deallocate_weights(self) -> None:
-        if type(self.weight) is not Parameter:
-            return
 
         self.fp8_init(num_gemms=1)
         assert self.fp8
@@ -2381,14 +2380,13 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self.reset_layer_norm_parameters()
 
         # FC1 init
-        self.fc1_weight = Parameter(
+        self.fc1_weight = \
             torch.empty(
                 self.size_per_partition,
                 hidden_size,
                 device=torch.cuda.current_device(),
                 dtype=params_dtype,
             )
-        )
 
         self.fp8_weight_shapes.append(self.fc1_weight.shape)
 
@@ -2413,14 +2411,14 @@ class LayerNormMLP(TransformerEngineBaseModule):
             self.fc1_bias.zero_()
 
         # FC2 init
-        self.fc2_weight = Parameter(
+        self.fc2_weight = \
             torch.empty(
                 hidden_size,
                 self.size_per_partition,
                 device=torch.cuda.current_device(),
                 dtype=params_dtype,
             )
-        )
+        
 
         self.fp8_weight_shapes.append(self.fc2_weight.shape)
 
@@ -2460,8 +2458,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 )
 
     def deallocate_weights(self) -> None:
-        if type(self.fc1_weight) is not Parameter or type(self.fc2_weight) is not Parameter:
-            return
+
         self.fp8_init(num_gemms=2)
         assert self.fp8
 
@@ -2490,11 +2487,13 @@ class LayerNormMLP(TransformerEngineBaseModule):
             cast_out=self.weight2_fp8,
             transpose_out=self.weight2_t_fp8,
         )
-
+        self.fc1_weight.cpu()
+        del self.fc1_weight
+        del self.fc2_weight
         self.fc1_weight = None
         self.fc2_weight = None
-        self.fp8_meta_tensors_initialized = True
 
+        self.fp8_meta_tensors_initialized = True
 
     def reset_layer_norm_parameters(self) -> None:
         """Init LN params"""

@@ -40,6 +40,8 @@ from transformer_engine.pytorch.distributed import (
     set_tensor_model_parallel_attributes,
 )
 
+import nvtx_profiler
+nvtx_marker = nvtx_profiler.nvtx_markers()
 
 class DropPath(torch.nn.Module):
     """Drop paths (Stochastic Depth) per sample
@@ -962,7 +964,6 @@ class TransformerLayer(torch.nn.Module):
     def deallocate_and_cast_weights(self) -> None:
         def fn(m):
             if hasattr(m,"deallocate_weights"):
-                print(m)
                 m.deallocate_weights()
         self.apply(fn)
 
@@ -1019,7 +1020,7 @@ class TransformerLayer(torch.nn.Module):
             hidden_states = cast_if_needed(
                 hidden_states, torch.get_autocast_gpu_dtype()
             )
-
+        nvtx_marker.push("self attn")
         # Self attention.
         self_attention_outputs = self.self_attention(
             hidden_states,
@@ -1033,7 +1034,8 @@ class TransformerLayer(torch.nn.Module):
         else:
             attention_output, attention_bias = self_attention_outputs
             residual = hidden_states
-
+        nvtx_marker.pop()
+        nvtx_marker.push("BDA")
         # Set BDA func.
         if self.bias_dropout_fusion:
             if self.training:
@@ -1056,7 +1058,8 @@ class TransformerLayer(torch.nn.Module):
                 training=self.training,
             )
             bda_output = residual + self.drop_path(out)
-
+        nvtx_marker.pop()
+        nvtx_marker.push("inter-atn, ln")
         # Cross attention.
         if self.layer_type == "decoder":
             inter_attention_outputs = self.inter_attention(
@@ -1076,6 +1079,8 @@ class TransformerLayer(torch.nn.Module):
                 bda_output = bias_dropout_add_func(
                     attention_output, attention_bias, residual, self.hidden_dropout
                 )
+        nvtx_marker.pop()
+        nvtx_marker.push("mlp")
 
         # MLP.
         mlp_outputs = self.layernorm_mlp(
@@ -1086,6 +1091,8 @@ class TransformerLayer(torch.nn.Module):
         else:
             mlp_output, mlp_bias = mlp_outputs
             residual = bda_output
+        nvtx_marker.pop()
+        nvtx_marker.push("BDA mlp")
 
         # Bias dropoout add.
         if self.drop_path is None:
@@ -1098,10 +1105,14 @@ class TransformerLayer(torch.nn.Module):
                 mlp_output + mlp_bias, p=self.hidden_dropout, training=self.training
             )
             output = residual + self.drop_path(out)
+        nvtx_marker.pop()
+        nvtx_marker.push("output ln")
 
         # For BERT like architectures.
         if self.output_layernorm:
             output = self.layernorm(output)
 
         # output: [b, s, h]
+        nvtx_marker.pop()
+
         return output
