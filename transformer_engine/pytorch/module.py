@@ -683,16 +683,12 @@ class _LayerNormLinear(torch.autograd.Function):
         ctx.parallel_mode = parallel_mode
         ctx.tp_group = tp_group
         ctx.return_layernorm_output = return_layernorm_output
-        print("**")
 
-        print(out.shape)
         # Row Parallel Linear
         if parallel_mode == "row" and sequence_parallel:
             out, _ = reduce_scatter_along_first_dim(out, tp_group)
         elif parallel_mode == "row" and tensor_parallel:
             out, _ = allreduce(out, tp_group)
-        print(out.shape)
-        print("**")
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
         out = out.view(-1, *inp.shape[1:-1], out.shape[-1])
 
