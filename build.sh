@@ -1,0 +1,1 @@
+MPI_HOME='/opt/hpcx/ompi/' NVTE_WITH_USERBUFFERS=1 pip install . -v

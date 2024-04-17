@@ -7,6 +7,7 @@
 #include "../extensions.h"
 #ifdef NVTE_WITH_USERBUFFERS
 #include "comm_gemm_overlap.h"
+#include "comm_gemm_overlap_nccl.h"
 #endif  // NVTE_WITH_USERBUFFERS
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -144,6 +145,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("is_atomic_gemm", &ubuf::UbufP2PCommOverlap::is_atomic_gemm)
     .def("is_p2p_overlap", &ubuf::UbufP2PCommOverlap::is_p2p_overlap)
     .def("set_ubuf_scale_inv", &ubuf::UbufP2PCommOverlap::set_ubuf_scale_inv);
+
+  py::class_<nccl_ubuf::NcclCommOverlap>(m, "NcclCommOverlap")
+    .def(py::init<int>());
+
+
 #else  // NVTE_WITH_USERBUFFERS
   m.def("UbufOverlapAlgo", &placeholder, "Dummy function for python side annotations");
   m.def("UbufCommOverlap", &placeholder, "Dummy function for python side annotations");

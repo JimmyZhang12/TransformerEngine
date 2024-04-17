@@ -101,6 +101,7 @@ int create_communicator_grouped2(communicator **comm, int pipegpus, int pipenode
                                  int tensornodes) {
   *comm = reinterpret_cast<communicator *>(malloc(sizeof(communicator)));
 
+
   int myrank, nranks, cur_dev, ndev;
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
   MPI_Comm_size(MPI_COMM_WORLD, &nranks);
@@ -108,6 +109,8 @@ int create_communicator_grouped2(communicator **comm, int pipegpus, int pipenode
   (*comm)->myrank = myrank;
   (*comm)->free_region = 0;
   (*comm)->launch_mode = NVTE_LAUNCH_GPU | NVTE_LAUNCH_CPU;
+  printf("create_communicator_grouped2  %d %d", nranks, myrank);
+
 
   cudaDeviceProp device_prop;
   CUDACHECK(cudaGetDevice(&cur_dev));

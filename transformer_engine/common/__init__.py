@@ -16,7 +16,8 @@ def get_te_path():
     command = [sys.executable, "-m", "pip", "show", "transformer_engine"]
     result = subprocess.run(command, capture_output=True, check=True, text=True)
     result = result.stdout.replace("\n", ":").split(":")
-    return result[result.index("Location") + 1].strip()
+    # return result[result.index("Location") + 1].strip()
+    return '/lustre/fsw/coreai_dlalgo_llm/jiemingz/bug4591875/TransformerEngine/build/lib.linux-x86_64-cpython-310'
 
 
 def _load_library():
@@ -34,7 +35,6 @@ def _load_library():
     lib_name = "libtransformer_engine." + extension
     dll_path = get_te_path()
     dll_path = os.path.join(dll_path, lib_name)
-
     return ctypes.CDLL(dll_path, mode=ctypes.RTLD_GLOBAL)
 
 
@@ -53,10 +53,8 @@ def _load_userbuffers():
     lib_name = "libtransformer_engine_userbuffers." + extension
     dll_path = get_te_path()
     dll_path = os.path.join(dll_path, lib_name)
-
-    if os.path.exists(dll_path):
-        return ctypes.CDLL(dll_path, mode=ctypes.RTLD_GLOBAL)
-    return None
+    print(dll_path)
+    return ctypes.CDLL(dll_path, mode=ctypes.RTLD_GLOBAL)
 
 
 _TE_LIB_CTYPES = _load_library()

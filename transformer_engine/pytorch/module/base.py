@@ -160,13 +160,17 @@ def initialize_ub(
                     tp_size,                # TP size
                     num_sm,                 # Number of communication SMs
                     cga_size,               # CGA cluster size
-                    set_sm_margin,          # Set SM margin
-                    aggregate,              # Aggregate 2X GEMM chunks
+                    bool(set_sm_margin),          # Set SM margin
+                    bool(aggregate),              # Aggregate 2X GEMM chunks
                     _NUM_MAX_UB_STREAMS,    # Max concurrent GEMM streams
-                    is_reduce_scatter,      # overlap with reduce scatter
-                    atomic_gemm,            # use a single GEMM with atomic-counters
+                    bool(is_reduce_scatter),      # overlap with reduce scatter
+                    bool(atomic_gemm),            # use a single GEMM with atomic-counters
                     torch.Tensor(),         # empty tensor to pass to counters
                 )
+#   UbufP2PCommOverlap(torch::Tensor sample, int rank, int tp_size, int num_comm_sm,
+#                      int comm_cga_size, bool set_sm_margin, bool aggregate2, int num_max_streams,
+#                      bool is_reduce_scatter, bool atomic_gemm, torch::Tensor empty_tensor)
+
         else:
             ub_obj = tex.UbufCommOverlap(
                     sample_buffer,          # Sample userbuffer
@@ -180,6 +184,11 @@ def initialize_ub(
                     atomic_gemm,            # use a single GEMM with atomic-counters
                     torch.Tensor(),         # empty tensor to pass to counters
                 )
+
+#   UbufCommOverlap(torch::Tensor sample, int rank, int tp_size, int num_comm_sm, int comm_cga_size,
+#                   int num_splits, bool set_sm_margin, int num_max_streams, bool atomic_gemm,
+#                   torch::Tensor empty_tensor) {
+
         _ub_communicators[name] = ub_obj
 
     if ub_cfgs is not None:
