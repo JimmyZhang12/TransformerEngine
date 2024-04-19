@@ -17,7 +17,7 @@ def get_te_path():
     result = subprocess.run(command, capture_output=True, check=True, text=True)
     result = result.stdout.replace("\n", ":").split(":")
     # return result[result.index("Location") + 1].strip()
-    return '/lustre/fsw/coreai_dlalgo_llm/jiemingz/bug4591875/TransformerEngine/build/lib.linux-x86_64-cpython-310'
+    return '/lustre/fsw/portfolios/llmservice/users/jiemingz/ncclcomms/TransformerEngine/build/lib.linux-x86_64-cpython-310'
 
 
 def _load_library():

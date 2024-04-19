@@ -147,7 +147,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("set_ubuf_scale_inv", &ubuf::UbufP2PCommOverlap::set_ubuf_scale_inv);
 
   py::class_<nccl_ubuf::NcclCommOverlap>(m, "NcclCommOverlap")
-    .def(py::init<int>());
+    .def(py::init<int, bool>())
+    .def("ring_exchange", &nccl_ubuf::NcclCommOverlap::RingExchange);
 
 
 #else  // NVTE_WITH_USERBUFFERS
