@@ -14,8 +14,7 @@
 #include "extensions.h"
 
 
-nccl_ubuf::NcclCommOverlap::NcclCommOverlap(int m, bool userbuffers){
-  MPI_Init(NULL, NULL);
+nccl_ubuf::NcclCommOverlap::NcclCommOverlap(int m, bool userbuffers, bool overlap){
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
   MPI_Comm_size(MPI_COMM_WORLD, &nranks);
 
@@ -43,6 +42,7 @@ nccl_ubuf::NcclCommOverlap::NcclCommOverlap(int m, bool userbuffers){
   
   dim = m;
 
+  _overlap = overlap;
   _userbuffers = userbuffers;
   if (_userbuffers){
     NCCLCHECK(ncclCommRegister(comm, sendbuf, size, &sendRegHandle));
@@ -91,51 +91,64 @@ void nccl_ubuf::NcclCommOverlap::RingExchange(
 
   int next_rank = (myrank + 1) % nranks;
   int prev_rank = (myrank - 1 + nranks) % nranks;
-
-  // Catch up the default torch stream
-  at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
-  CHECK_CUDA(cudaEventRecord(_start_compute, (cudaStream_t)stream_main));
-  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_compute, 0));
-
-
   int num_exchanges = nranks-1;
-  for (int i=0; i<num_exchanges; i++){
-    at::cuda::setCurrentCUDAStream(_stream_compute[i]);
-    CHECK_CUDA(cudaStreamWaitEvent(_stream_compute[i], _stop_comm, 0));
 
+  if (_overlap){
+    // Catch up the default torch stream
+    at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA(cudaEventRecord(_start_compute, (cudaStream_t)stream_main));
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_compute, 0));
+
+    for (int i=0; i<num_exchanges; i++){
+      at::cuda::setCurrentCUDAStream(_stream_compute[i]);
+      te_gemm(A, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb, D, D_scale,
+              D_type, D_amax, bias, bias_type, pre_gelu_out, grad, workspace, workspaceSize,
+              accumulate, use_split_accumulator, _math_sms);
+
+      ncclGroupStart();
+      ncclSend(sendbuf, dim, nccl_type, next_rank, comm, _stream_comm.stream());
+      ncclRecv(recvbuf, dim, nccl_type, prev_rank, comm, _stream_comm.stream());
+      ncclGroupEnd();
+    
+      // next gemm chunk waits for this iteration's comm to finish
+      CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t)_stream_comm));
+      CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_compute[i+1], _stop_comm, 0));
+
+    }
+
+    at::cuda::setCurrentCUDAStream(_stream_compute[num_exchanges]);
     te_gemm(A, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb, D, D_scale,
             D_type, D_amax, bias, bias_type, pre_gelu_out, grad, workspace, workspaceSize,
             accumulate, use_split_accumulator, _math_sms);
 
-    ncclGroupStart();
-    ncclSend(sendbuf, dim, nccl_type, next_rank, comm, _stream_comm.stream());
-    ncclRecv(recvbuf, dim, nccl_type, prev_rank, comm, _stream_comm.stream());
-    ncclGroupEnd();
-
-  
-    // next gemm chunk waits for this iteration's comm to finish
+    // all streams must finish before returning to Pytorch main stream
+    for (int i = 0; i < _stream_compute.size(); i++) {
+      CHECK_CUDA(
+          cudaEventRecord(_stop_compute, (cudaStream_t)_stream_compute[i]));
+      CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_compute, 0));
+    }
     CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t)_stream_comm));
-    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_compute[i+1], _stop_comm, 0));
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_comm, 0));
+    at::cuda::setCurrentCUDAStream(stream_main);
 
   }
+  else {
+    for (int i=0; i<num_exchanges; i++){
+        te_gemm(A, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb, D, D_scale,
+                D_type, D_amax, bias, bias_type, pre_gelu_out, grad, workspace, workspaceSize,
+                accumulate, use_split_accumulator, _math_sms);
 
-  at::cuda::setCurrentCUDAStream(_stream_compute[num_exchanges]);
-  te_gemm(A, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb, D, D_scale,
-          D_type, D_amax, bias, bias_type, pre_gelu_out, grad, workspace, workspaceSize,
-          accumulate, use_split_accumulator, _math_sms);
+        if (i < num_exchanges-1){
+          ncclGroupStart();
+          ncclSend(sendbuf, dim, nccl_type, next_rank, comm, 0);
+          ncclRecv(recvbuf, dim, nccl_type, prev_rank, comm, 0);
+          ncclGroupEnd();
+        }
 
-  // all streams must finish before returning to Pytorch main stream
-  for (int i = 0; i < _stream_compute.size(); i++) {
-    CHECK_CUDA(
-        cudaEventRecord(_stop_compute, (cudaStream_t)_stream_compute[i]));
-    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_compute, 0));
+      }
   }
-  CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t)_stream_comm));
-  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_comm, 0));
-  at::cuda::setCurrentCUDAStream(stream_main);
 
 }
-
 void nccl_ubuf::NcclCommOverlap::print_tensor(torch::Tensor tensor){
   cudaDeviceSynchronize();
   for (int i=0; i<nranks; i++){

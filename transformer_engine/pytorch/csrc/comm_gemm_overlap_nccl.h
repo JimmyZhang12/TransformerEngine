@@ -58,6 +58,7 @@ struct NcclCommOverlap : torch::CustomClassHolder{
   void* sendRegHandle;
   void* recvRegHandle;
   bool _userbuffers;
+  bool _overlap;
 
   int dim, myrank, nranks, _math_sms;
   ncclComm_t comm;
@@ -69,7 +70,7 @@ struct NcclCommOverlap : torch::CustomClassHolder{
   cudaEvent_t _start_compute, _stop_compute, _stop_comm;
 
 
-  NcclCommOverlap(int m, bool userbuffers);
+  NcclCommOverlap(int m, bool userbuffers, bool overlap);
   void RingExchange(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
                transformer_engine::DType A_type, bool transa, at::Tensor B,
                at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type,
