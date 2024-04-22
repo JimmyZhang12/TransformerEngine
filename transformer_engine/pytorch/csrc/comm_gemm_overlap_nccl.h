@@ -23,6 +23,7 @@
 #include <nccl.h>
 #include <mpi.h>
 
+#include <vector>
 
 #define HALF_BYTES 2
 #define UB_MAX_SM 32
@@ -58,11 +59,25 @@ struct NcclCommOverlap : torch::CustomClassHolder{
   void* recvRegHandle;
   bool _userbuffers;
 
-  int dim, myrank, nranks;
+  int dim, myrank, nranks, _math_sms;
   ncclComm_t comm;
+  std::vector<at::cuda::CUDAStream> _stream_compute;
+
+  //TODO: CUDAStream doesnt have a default constuctor but instantiating here causes errors
+  at::cuda::CUDAStream _stream_comm = at::cuda::getStreamFromPool(true); 
+
+  cudaEvent_t _start_compute, _stop_compute, _stop_comm;
+
 
   NcclCommOverlap(int m, bool userbuffers);
-  void RingExchange(bool debug_print);
+  void RingExchange(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+               transformer_engine::DType A_type, bool transa, at::Tensor B,
+               at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type,
+               bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type,
+               at::Tensor D_amax, at::Tensor bias, transformer_engine::DType bias_type,
+               at::Tensor pre_gelu_out, bool grad, at::Tensor workspace, size_t workspaceSize,
+               bool accumulate, bool use_split_accumulator, int comm_type, at::Tensor rs_output,
+               bool debug_print);
   void print_tensor(torch::Tensor tensor);
 
   ~NcclCommOverlap();
