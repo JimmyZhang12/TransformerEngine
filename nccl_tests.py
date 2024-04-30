@@ -5,35 +5,42 @@ import transformer_engine.pytorch as te
 from transformer_engine.pytorch.float8_tensor import Float8Tensor
 import transformer_engine_extensions as tex
 
-import torch, time
+import torch, time, os
 from mpi4py import MPI
 
 comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
 wsize = comm.Get_size()
 
+os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_PORT"] = "12345"
+
 torch.cuda.set_device(rank)
 torch.distributed.init_process_group(backend='nccl', world_size=wsize, rank=rank)
 
-# fp8_dtype = tex.DType.kFloat8E4M3
-# recipe = transformer_engine.common.recipe.DelayedScaling(
-#     fp8_format=transformer_engine.common.recipe.Format.E4M3,
-# )
-# with te.fp8_autocast(enabled=False, fp8_recipe=recipe):
-#     te.module.base.initialize_ub(
-#         shape=[2048,4096],
-#         tp_size=wsize,
-#     )
-#     module = te.Linear(
-#         in_features=32, 
-#         out_features=32, 
-#         tp_size=wsize,
-#         ub_overlap_rs=True,
-#         ub_overlap_ag=True,
-#         ub_name='proj')
-#     module.set_tensor_parallel_group(torch.distributed.group.WORLD)
 
-#     _ = module(torch.zeros([8, 32], device="cuda"))
+
+def userbuffers():
+    fp8_dtype = tex.DType.kFloat8E4M3
+    recipe = transformer_engine.common.recipe.DelayedScaling(
+        fp8_format=transformer_engine.common.recipe.Format.E4M3,
+    )
+    with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+        te.module.base.initialize_ub(
+            shape=[2048,4096],
+            tp_size=wsize,
+        )
+        module = te.Linear(
+            in_features=32, 
+            out_features=32, 
+            tp_size=wsize,
+            ub_overlap_rs=True,
+            ub_overlap_ag=True,
+            ub_name='proj')
+        module.set_tensor_parallel_group(torch.distributed.group.WORLD)
+
+        _ = module(torch.zeros([8, 32], device="cuda"))
+
 def test_baseline_ag_gemm(torch_dtype):
     input_features = 8192
     output_features = 8192*3
@@ -61,45 +68,47 @@ def test_baseline_ag_gemm(torch_dtype):
     if torch.cuda.current_device() == 0:
         print(f"AVG TIME {avgtime}")
 
-def test_nccl_ring_ex(torch_dtype):
+def test_nccl_ring_ex(
+    input_features, 
+    output_features, 
+    sequence_len,
+    cpsize,
+    tpsize,
+    torch_dtype):
     # A(outf, inpf)^T X B(seq, inpf)
 
     if torch_dtype == torch.float:
         te_type = tex.DType.kFloat32
     elif torch_dtype == torch.bfloat16:
         te_type = tex.DType.kBFloat16
+    elif torch_dtype == torch.uint8:
+        te_type = tex.DType.kFloat8E4M3
 
-
-    input_features = 8192
-    output_features = 8192*3
-    sequence_len = 4096
-    nsplit = 4
-    tpsize = 4
+    gemm_chunks = tpsize
 
     A_chunk_dim = [output_features//tpsize,input_features]
-    B_chunk_dim = [sequence_len//nsplit,input_features]
-    D_chunk_dim = [sequence_len//nsplit,output_features//tpsize]
+    B_chunk_dim = [sequence_len//tpsize//cpsize,input_features]
+    D_chunk_dim = [sequence_len//cpsize,output_features//tpsize]
 
-    B_numel = sequence_len//nsplit*input_features
-    print(f"{B_chunk_dim} * {A_chunk_dim}^T")
-    nccl_gemm_overlap = tex.NcclCommOverlap(B_numel, True, True)
-
+    sample = torch.zeros([sequence_len//cpsize, input_features], dtype=torch_dtype).cuda()
+    nccl_gemm_overlap = tex.NcclCommOverlap(sample, gemm_chunks, False, True)
+    
     #emulate proj fprop
-    A = torch.zeros(A_chunk_dim, dtype=torch.float).cuda()
-    A_scale_inverse = torch.Tensor()
-    A_fp8_tensor = -1
+    A = torch.ones(A_chunk_dim, dtype=torch_dtype).cuda()
+    A_scale_inverse = torch.Tensor([1,1,1]).cuda()
+    A_fp8_tensor = tex.FP8FwdTensors.GEMM1_WEIGHT
     A_type = te_type
     transa = True
 
-    B = torch.zeros(B_chunk_dim, dtype=torch.float).cuda()
-    B_scale_inverse = torch.Tensor()
-    B_fp8_tensor = -1
+    B = torch.ones(B_chunk_dim, dtype=torch_dtype).cuda()
+    B_scale_inverse = torch.Tensor([1,1,1]).cuda()
+    B_fp8_tensor = tex.FP8FwdTensors.GEMM1_INPUT
     B_type = te_type
     transb = False
 
-    D = torch.zeros(D_chunk_dim, dtype=torch.float).cuda()
+    D = torch.zeros(D_chunk_dim, dtype=torch.bfloat16).cuda()
     D_scale = torch.Tensor()
-    D_type= te_type
+    D_type = tex.DType.kBFloat16
     D_amax = torch.Tensor()
 
     bias = torch.Tensor()
@@ -113,18 +122,22 @@ def test_nccl_ring_ex(torch_dtype):
 
     accumulate=False
     use_split_accumulator = False
-    comm_type = 0
     rs_output = torch.zeros([2,32], dtype=torch.float32).cuda()
 
     debug_print=False
 
     iters = 5
     for i in range(iters):
-        if i == 1:
-            torch.cuda.synchronize()
-            tic = time.time()
+        # if i == 1:
+        #     torch.cuda.synchronize()
+        #     tic = time.time()
+        nccl_gemm_overlap.copy_input_to_ubuf(B, True)
+        # if torch.cuda.current_device() == 0:
+        #     import pdb
+        #     pdb.set_trace()
+        # torch.distributed.barrier()  
 
-        nccl_gemm_overlap.ring_exchange(
+        out = nccl_gemm_overlap.ring_exchange(
             A, A_scale_inverse,  A_fp8_tensor,
             A_type, transa,
             B, B_scale_inverse,  B_fp8_tensor, 
@@ -132,18 +145,142 @@ def test_nccl_ring_ex(torch_dtype):
             D, D_scale, D_type,
             D_amax, bias, bias_type,
             pre_gelu_out, grad, workspace, workspaceSize,
-            accumulate, use_split_accumulator, comm_type, rs_output,
-            debug_print
-        )
-    torch.cuda.synchronize()
-    toc = time.time()
-    ttime = toc -tic
-    avgtime = ttime/(iters-1)
-    if torch.cuda.current_device() == 0:
-        print(f"AVG TIME {avgtime}")
+            accumulate, use_split_accumulator, rs_output)
+        torch.cuda.synchronize()
+
+        # if torch.cuda.current_device() == 0:
+        #     import pdb
+        #     pdb.set_trace()
+        # torch.distributed.barrier()    
+    # fp8_gemm(
+    #     A: torch.Tensor,
+    #     A_scale_inv: torch.Tensor,
+    #     A_fp8_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors],
+    #     A_dtype: tex.DType,
+    #     B: torch.Tensor,
+    #     B_scale_inv: torch.Tensor,
+    #     B_fp8_tensor: Union[tex.FP8FwdTensors, tex.FP8BwdTensors],
+    #     B_dtype: tex.DType,
+    #     out_dtype: torch.dtype,
+    #     workspace: torch.Tensor,
+    #     gelu: bool = False,
+    #     accumulate: bool = False,
+    #     out: Optional[torch.Tensor] = None,
+    #     out_index = None,
+    #     fp8_meta_tensor: tex.FP8TensorMeta = None,
+    #     bias: Optional[torch.Tensor] = None,
+    #     use_bias: bool = False,
+    #     use_split_accumulator: bool = False,
+    #     D_dtype: Optional[tex.DType] = None,
+
+    # toc = time.time()
+    # ttime = toc -tic
+    # avgtime = ttime/(iters-1)
+    # if torch.cuda.current_device() == 0:
+    #     print(f"AVG TIME {avgtime}")
+
+
+
+
+def test_rs(
+    input_features, 
+    output_features, 
+    sequence_len,
+    cpsize,
+    tpsize,
+    torch_dtype):
+    # A(outf, inpf)^T X B(seq, inpf)
+
+    if torch_dtype == torch.float:
+        te_type = tex.DType.kFloat32
+    elif torch_dtype == torch.bfloat16:
+        te_type = tex.DType.kBFloat16
+    elif torch_dtype == torch.uint8:
+        te_type = tex.DType.kFloat8E4M3
+
+    gemm_chunks = tpsize
+
+    A_chunk_dim = [output_features,input_features//tpsize]
+    B_chunk_dim = [sequence_len//cpsize,input_features//tpsize]
+    D_chunk_dim = [sequence_len//cpsize, output_features]
+
+    sample = torch.zeros([sequence_len//cpsize * tpsize, output_features], dtype=torch_dtype).cuda()
+    nccl_gemm_overlap = tex.NcclCommOverlap(sample, gemm_chunks, False, gemm_chunks)
+    
+    A = torch.ones(A_chunk_dim, dtype=torch_dtype).cuda()
+    A_scale_inverse = torch.Tensor([1,1,1]).cuda()
+    A_fp8_tensor = tex.FP8FwdTensors.GEMM1_WEIGHT
+    A_type = te_type
+    transa = True
+
+    B = torch.ones(B_chunk_dim, dtype=torch_dtype).cuda()
+    B_scale_inverse = torch.Tensor([1,1,1]).cuda()
+    B_fp8_tensor = tex.FP8FwdTensors.GEMM1_INPUT
+    B_type = te_type
+    transb = False
+
+    D = torch.zeros(D_chunk_dim, dtype=torch.bfloat16).cuda()
+    D_scale = torch.Tensor()
+    D_type = tex.DType.kBFloat16
+    D_amax = torch.Tensor()
+
+    bias = torch.Tensor()
+    bias_type = te_type
+
+    pre_gelu_out = torch.Tensor()
+    grad = False
+
+    workspace = torch.zeros([64*1024*1024],dtype=torch.uint8).cuda()
+    workspaceSize = workspace.shape[0]
+
+    accumulate=False
+    use_split_accumulator = False
+    rs_output = torch.zeros([1024*8192], dtype=torch_dtype).cuda()
+
+    debug_print=False
+
+    iters = 5
+    for i in range(iters):
+        # if i == 1:
+        #     torch.cuda.synchronize()
+        #     tic = time.time()
+        out = nccl_gemm_overlap.split_overlap_rs(
+            A, A_scale_inverse,  A_fp8_tensor,
+            A_type, transa,
+            B, B_scale_inverse,  B_fp8_tensor, 
+            B_type, transb, 
+            D, D_scale, D_type,
+            D_amax, bias, bias_type,
+            pre_gelu_out, grad, workspace, workspaceSize,
+            accumulate, use_split_accumulator, rs_output)
+        torch.cuda.synchronize()
+
 
 if __name__ == "__main__":
+    # userbuffers()
     torch.cuda.cudart().cudaProfilerStart()
-    test_baseline_ag_gemm(torch.bfloat16)
-    test_nccl_ring_ex(torch.bfloat16)
+    # test_baseline_ag_gemm(torch.bfloat16)
+    # test_nccl_ring_ex(
+    #     input_features = 8192,
+    #     output_features = 10240, #GQA (8192/64*(64+8+8)) 
+    #     sequence_len = 4096,
+    #     tpsize = 2,
+    #     cpsize = 2,
+    #     torch_dtype = torch.bfloat16)
+
+    test_rs(
+        input_features = 8192,
+        output_features = 8192, #FFN1 chunks gate plus fc1
+        sequence_len = 4096,
+        tpsize = 2,
+        cpsize = 2,
+        torch_dtype = torch.uint8)
+
+    # test_nccl_ring_ex(
+    #     input_features = 8192,
+    #     output_features = 28672*2, #FFN1 chunks gate plus fc1
+    #     sequence_len = 4096,
+    #     tpsize = 2,
+    #     cpsize = 2,
+    #     torch_dtype = torch.uint8)
     torch.cuda.cudart().cudaProfilerStop()

@@ -445,7 +445,7 @@ def setup_pytorch_extension() -> setuptools.Extension:
     sources = [
         src_dir / "common.cu",
         src_dir / "ts_fp8_op.cpp",
-        src_dir / "comm_gemm_overlap_nccl.cpp",
+        src_dir / "comm_gemm_overlap_nccl.cu",
      
         # We need to compile system.cpp because the pytorch extension uses
         # transformer_engine::getenv. This is a workaround to avoid direct
