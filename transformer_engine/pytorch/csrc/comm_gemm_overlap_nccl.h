@@ -88,8 +88,9 @@ struct NcclCommOverlap : torch::CustomClassHolder{
 
   cudaEvent_t _start_compute, _stop_compute, _stop_comm, _start_comm;
 
-  NcclCommOverlap(at::Tensor sample, int nchunks, bool userbuffers, int num_max_streams);
-  torch::Tensor RingExchange(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+  NcclCommOverlap(at::Tensor sample, int nchunks, bool userbuffers, int num_max_streams,
+              bool is_reduce_scatter);
+  torch::Tensor split_overap_ag(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
                transformer_engine::DType A_type, bool transa, at::Tensor B,
                at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type,
                bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type,
@@ -98,6 +99,14 @@ struct NcclCommOverlap : torch::CustomClassHolder{
                bool accumulate, bool use_split_accumulator, at::Tensor B_copy);
 
   void split_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+                        transformer_engine::DType A_type, bool transa, at::Tensor B,
+                        at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type, 
+                        bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type, 
+                        at::Tensor D_amax, at::Tensor bias, transformer_engine::DType bias_type,
+                        at::Tensor pre_gelu_out, bool grad, at::Tensor workspace, size_t workspaceSize, 
+                        bool accumulate, bool use_split_accumulator, at::Tensor rs_output);
+
+  void playground(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
                         transformer_engine::DType A_type, bool transa, at::Tensor B,
                         at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type, 
                         bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type, 

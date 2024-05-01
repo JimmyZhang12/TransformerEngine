@@ -147,9 +147,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("set_ubuf_scale_inv", &ubuf::UbufP2PCommOverlap::set_ubuf_scale_inv);
 
   py::class_<nccl_ubuf::NcclCommOverlap>(m, "NcclCommOverlap")
-    .def(py::init<torch::Tensor&, int, bool, int>())
-    .def("ring_exchange", &nccl_ubuf::NcclCommOverlap::RingExchange)
+    .def(py::init<torch::Tensor&, int, bool, int, bool>())
+    .def("split_overlap_ag", &nccl_ubuf::NcclCommOverlap::split_overap_ag)
     .def("split_overlap_rs", &nccl_ubuf::NcclCommOverlap::split_overlap_rs)
+    .def("playground", &nccl_ubuf::NcclCommOverlap::playground)
     .def("copy_input_to_ubuf", &nccl_ubuf::NcclCommOverlap::copy_input_to_ubuf)
     .def("get_ubuf_output", &nccl_ubuf::NcclCommOverlap::get_ubuf_output);
 

@@ -20,12 +20,12 @@ NSYS="nsys profile -s none -o /home/jiemingz/nccl_comms/profiles/profile_nofp8ov
 
 export CUBLASLT_LOG_LEVEL=2
 
-COMM_SMS=8
-NCHANNELS=8
+COMM_SMS=1
+NCHANNELS=1
 
 NCCL_MIN_NCHANNELS=${NCHANNELS} \
 NCCL_MAX_NCHANNELS=${NCHANNELS} \
-NVTE_EXT_MARGIN_SM=${COMM_SMS} \
+NVTE_EXT_MARGIN_SM=64 \
 NCCL_MAX_CTAS=${COMM_SMS} \
 NCCL_MIX_CTAS=${COMM_SMS} \
 mpirun -n 2 --allow-run-as-root --oversubscribe ${NSYS} python -u nccl_tests.py
