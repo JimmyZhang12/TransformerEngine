@@ -223,6 +223,11 @@ class FP8GlobalStateManager:
                 forward, fp8_weights is not None, fp8_meta["recipe"], fp8_meta["fp8_group"])
             fp8_meta_tensor_key = cls.get_meta_tensor_key(forward=forward)
 
+            # if torch.cuda.current_device() == 0:
+            #     import pdb
+            #     pdb.set_trace()
+            # torch.distributed.barrier()
+
             if key not in cls.global_amax_buffer:
                 cls.global_amax_buffer[key] = [fp8_meta[fp8_meta_tensor_key].amax_history[0]]
                 cls.global_amax_history_buffer[key] = [fp8_meta[fp8_meta_tensor_key].amax_history]
@@ -319,6 +324,7 @@ class FP8GlobalStateManager:
         forward: bool = True,
         fp8_weights: bool = False,
     ) -> None:
+
         """Concatenate, reduce, and split amaxes in the global buffer."""
         for buffer_key, amax_buffer in cls.global_amax_buffer.items():
             # Check for forward or backward reduction.

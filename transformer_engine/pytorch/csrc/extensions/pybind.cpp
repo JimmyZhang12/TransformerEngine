@@ -147,13 +147,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     .def("set_ubuf_scale_inv", &ubuf::UbufP2PCommOverlap::set_ubuf_scale_inv);
 
   py::class_<nccl_ubuf::NcclCommOverlap>(m, "NcclCommOverlap")
-    .def(py::init<torch::Tensor&, int, bool, int, bool>())
-    .def("split_overlap_ag", &nccl_ubuf::NcclCommOverlap::split_overap_ag)
-    .def("split_overlap_rs", &nccl_ubuf::NcclCommOverlap::split_overlap_rs)
-    .def("playground", &nccl_ubuf::NcclCommOverlap::playground)
+    .def(py::init<torch::Tensor&, int, int, int, int, bool, bool, bool, bool, bool>())
+    .def("split_overlap_ag_p2p", &nccl_ubuf::NcclCommOverlap::split_overlap_ag_p2p)
+    .def("split_overlap_rs_p2p", &nccl_ubuf::NcclCommOverlap::split_overlap_rs_p2p)
+    .def("bulk_overlap", &nccl_ubuf::NcclCommOverlap::bulk_overlap)
     .def("copy_input_to_ubuf", &nccl_ubuf::NcclCommOverlap::copy_input_to_ubuf)
-    .def("get_ubuf_output", &nccl_ubuf::NcclCommOverlap::get_ubuf_output);
-
+    .def("get_ubuf_output", &nccl_ubuf::NcclCommOverlap::get_ubuf_output)
+    .def("is_fp8_ubuf", &nccl_ubuf::NcclCommOverlap::is_fp8_ubuf)
+    .def("is_atomic_gemm", &nccl_ubuf::NcclCommOverlap::is_atomic_gemm)
+    .def("is_p2p_overlap", &nccl_ubuf::NcclCommOverlap::is_p2p_overlap)
+    .def("set_ubuf_scale_inv", &nccl_ubuf::NcclCommOverlap::set_ubuf_scale_inv);
 
 #else  // NVTE_WITH_USERBUFFERS
   m.def("UbufOverlapAlgo", &placeholder, "Dummy function for python side annotations");

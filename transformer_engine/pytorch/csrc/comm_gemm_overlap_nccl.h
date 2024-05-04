@@ -77,7 +77,7 @@ struct NcclCommOverlap : torch::CustomClassHolder{
   torch::Tensor _ubuf_scale_inv;
   bool _ubuf_scale_inv_initialized;
   bool _atomic_gemm = false;
-  int _self_chunk_id, _rank_round_tp;
+  int _self_chunk_id, _rank_round_tp, _num_max_streams;
 
   int _num_chunks, _tp_id, _tp_size, _total_sms, _math_sms, _next_rank, _prev_rank, rank;
   ncclComm_t comm;
@@ -85,12 +85,15 @@ struct NcclCommOverlap : torch::CustomClassHolder{
 
   //TODO: CUDAStream doesnt have a default constuctor but instantiating here causes errors
   at::cuda::CUDAStream _stream_comm = at::cuda::getStreamFromPool(true); 
-
   cudaEvent_t _start_compute, _stop_compute, _stop_comm, _start_comm;
 
-  NcclCommOverlap(at::Tensor sample, int nchunks, bool userbuffers, int num_max_streams,
-              bool is_reduce_scatter);
-  torch::Tensor split_overap_ag(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+  NcclCommOverlap(torch::Tensor sample, 
+                int rank, int tp_size, int num_comm_sm, int num_max_streams, 
+                bool set_sm_margin, bool aggregate2, bool is_reduce_scatter, 
+                bool atomic_gemm, bool userbuffers);
+
+
+  torch::Tensor split_overlap_ag_p2p(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
                transformer_engine::DType A_type, bool transa, at::Tensor B,
                at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type,
                bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type,
@@ -98,13 +101,21 @@ struct NcclCommOverlap : torch::CustomClassHolder{
                at::Tensor pre_gelu_out, bool grad, at::Tensor workspace, size_t workspaceSize,
                bool accumulate, bool use_split_accumulator, at::Tensor B_copy);
 
-  void split_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+  void split_overlap_rs_p2p(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
                         transformer_engine::DType A_type, bool transa, at::Tensor B,
                         at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type, 
                         bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type, 
                         at::Tensor D_amax, at::Tensor bias, transformer_engine::DType bias_type,
                         at::Tensor pre_gelu_out, bool grad, at::Tensor workspace, size_t workspaceSize, 
                         bool accumulate, bool use_split_accumulator, at::Tensor rs_output);
+
+  std::vector<at::Tensor> bulk_overlap(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+               transformer_engine::DType A_type, bool transa, at::Tensor B,
+               at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type,
+               bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type,
+               at::Tensor D_amax, at::Tensor bias, transformer_engine::DType bias_type,
+               at::Tensor pre_gelu_out, bool grad, at::Tensor workspace, size_t workspaceSize,
+               bool accumulate, bool use_split_accumulator, int comm_type, at::Tensor rs_output); 
 
   void playground(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
                         transformer_engine::DType A_type, bool transa, at::Tensor B,
@@ -114,23 +125,19 @@ struct NcclCommOverlap : torch::CustomClassHolder{
                         at::Tensor pre_gelu_out, bool grad, at::Tensor workspace, size_t workspaceSize, 
                         bool accumulate, bool use_split_accumulator, at::Tensor rs_output);
 
+  void copy_input_to_ubuf(torch::Tensor input, bool chunk);
+  torch::Tensor get_ubuf_output(int comm_type);
+
   template <typename fp8type>
   void reduce_fp8_in_bf16_out(void *inputs, void *output, float *scale, int num_inputs,
                               int input_size, cudaStream_t stream);
-
+  bool is_fp8_ubuf() { return (_ubuf.element_size() == 1); }
+  bool is_atomic_gemm() { return _atomic_gemm; }
+  bool is_p2p_overlap() { return true; }
   void set_ubuf_scale_inv(const torch::Tensor &scale_inv) {
     _ubuf_scale_inv = scale_inv;
     _ubuf_scale_inv_initialized = true;
   }
-
-  bool is_fp8_ubuf() { return (_ubuf.element_size() == 1); }
-  bool is_atomic_gemm() { return _atomic_gemm; }
-  bool is_p2p_overlap() { return true; }
-
-
-  void copy_input_to_ubuf(torch::Tensor input, bool chunk);
-  torch::Tensor get_ubuf_output(int comm_type);
-
 
   ~NcclCommOverlap();
 };

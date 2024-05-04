@@ -16,20 +16,17 @@
 
 #define MAX_THREADS 1024
 
-nccl_ubuf::NcclCommOverlap::NcclCommOverlap(
-  at::Tensor sample, int nchunks, bool userbuffers, 
-  int num_max_streams, bool is_reduce_scatter){
+nccl_ubuf::NcclCommOverlap::NcclCommOverlap(torch::Tensor sample, 
+  int rank, int tp_size, int num_comm_sm, int num_max_streams, 
+  bool set_sm_margin, bool aggregate2, bool is_reduce_scatter, bool atomic_gemm, bool userbuffers){
 
-  MPI_Comm_rank(MPI_COMM_WORLD, &_tp_id);
-  MPI_Comm_size(MPI_COMM_WORLD, &_tp_size);
-
+  _tp_size = tp_size;
+  _tp_id = rank % tp_size;
   printf("HelloWorld- myrank:%d ranks: %d\n", _tp_id, _tp_size);
-  int tp_size = _tp_size;
 
   ncclUniqueId id;
-  ncclGetUniqueId(&id);
-
   if (_tp_id == 0){
+    ncclGetUniqueId(&id);
     for (int i=1; i<_tp_size; i++){
       MPI_Send(&id, sizeof(id), MPI_BYTE, i, 0, MPI_COMM_WORLD);
     }
@@ -42,17 +39,15 @@ nccl_ubuf::NcclCommOverlap::NcclCommOverlap(
 
 
   _self_chunk_id = _tp_id;
-
-  rank = _tp_id;
-
   _rank_round_tp = (rank / tp_size) * tp_size;
   _next_rank = (tp_size + rank + 1) % tp_size + _rank_round_tp;
   _prev_rank = (tp_size + rank + -1) % tp_size + _rank_round_tp;
   _ubuf_scale_inv_initialized = false;
 
   _userbuffers = userbuffers;
-  _num_chunks = nchunks;
+  _num_chunks = _tp_size;
   _atomic_gemm = false;
+  _num_max_streams = num_max_streams;
 
   // Create workspace tensor with userbuffer
   int ubuf_bytes = sample.numel() * sample.element_size();
@@ -62,7 +57,7 @@ nccl_ubuf::NcclCommOverlap::NcclCommOverlap(
   if (is_reduce_scatter) {
     // GEMM + RS overlap: Allocate `2 x tp_size - 1` buffers to hold recieved GEMM chunk
     // outputs for reduction at the end of the pipelining.
-    ubuf_bytes = static_cast<int>(ubuf_bytes / tp_size * (tp_size * 2 - 1));
+    ubuf_bytes = static_cast<int>(ubuf_chunk_bytes * (tp_size * 2 - 1));
     num_ubuf_chunks = static_cast<int>(tp_size * 2 - 1);
   }
 
@@ -77,7 +72,7 @@ nccl_ubuf::NcclCommOverlap::NcclCommOverlap(
 
   // Create tensor chunks for easy management
   char *ubuf_byte_ptr = reinterpret_cast<char *>(_ubuf.data_ptr());
-  printf("_ubuf shape [%d, %d] \n", sample.size(0) / tp_size, sample.size(1));
+  printf("ubuf_bytes %d, num_ubuf_chunks %d, _ubuf shape [%d, %d] \n", ubuf_bytes, num_ubuf_chunks, sample.size(0) / tp_size, sample.size(1));
 
   for (int i = 0; i < num_ubuf_chunks; i++) {
     torch::Tensor ubuf_chunk = torch::from_blob(
@@ -91,8 +86,11 @@ nccl_ubuf::NcclCommOverlap::NcclCommOverlap(
   _math_sms = prop.multiProcessorCount - transformer_engine::getenv<int>("NVTE_EXT_MARGIN_SM", 0);
   _stream_comm = at::cuda::getStreamFromPool(true); 
 
+  printf("_num_max_streams %d _num_chuncks %d\n", _num_max_streams, _num_chunks );
+
+
   at::cuda::CUDAStream stream_main = at::cuda::getDefaultCUDAStream();
-  for (int i = 0; i < std::min(num_max_streams, nchunks); i++) {
+  for (int i = 0; i < std::min(_num_max_streams, _num_chunks); i++) {
     cudaStream_t stream;
     cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, -1);
     _stream_compute.push_back(
@@ -106,7 +104,98 @@ nccl_ubuf::NcclCommOverlap::NcclCommOverlap(
 
 }
 
-torch::Tensor nccl_ubuf::NcclCommOverlap::split_overap_ag(
+  /*
+  ** Bulk GEMM + COMM
+  ** This function assumes the communication input is pre-copied to _ubuf
+  */
+  std::vector<at::Tensor>
+  nccl_ubuf::NcclCommOverlap::bulk_overlap(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+               transformer_engine::DType A_type, bool transa, at::Tensor B,
+               at::Tensor B_scale_inverse, int64_t B_fp8_tensor, transformer_engine::DType B_type,
+               bool transb, at::Tensor D, at::Tensor D_scale, transformer_engine::DType D_type,
+               at::Tensor D_amax, at::Tensor bias, transformer_engine::DType bias_type,
+               at::Tensor pre_gelu_out, bool grad, at::Tensor workspace, size_t workspaceSize,
+               bool accumulate, bool use_split_accumulator, int comm_type, at::Tensor rs_output) {
+
+    // TODO
+    ncclDataType_t nccl_type; 
+    if (_ubuf.element_size() == 4)
+      nccl_type = ncclFloat;
+    else if (_ubuf.element_size() == 2)
+      nccl_type = ncclBfloat16;
+    else if (_ubuf.element_size() == 1)
+      nccl_type = ncclUint8;
+
+    COMM_TYPE _comm_type = static_cast<COMM_TYPE>(comm_type);
+
+    // Catch up the default torch stream
+    at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
+    CHECK_CUDA(cudaEventRecord(_start_comm, (cudaStream_t)stream_main));
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_comm, 0));
+
+    // Communication: AG and RS
+    int sendcount = _ubufs[0].numel();
+    if (_comm_type == COMM_TYPE::AG) {
+      int ubuf_chunk_bytes = _ubufs[0].numel()*_ubufs[0].element_size();
+      void* recvbuff = _ubufs[0].data_ptr();
+      void* sendbuff = recvbuff + _tp_id*ubuf_chunk_bytes;
+      NCCLCHECK(ncclAllGather(sendbuff, recvbuff, _ubufs[0].numel(), nccl_type, comm, _stream_comm));
+
+    } else if (_comm_type == COMM_TYPE::RS) {//No NCCL FP8 support so RS using ring exchange with explicit reduction
+      for (int i=0; i<_tp_size; i++){
+        printf("bulkoverap_rs: _tp_id %d i %d send_chunk_id %d recv_chunk_id %d do_gelu %d\n", 
+            _tp_id, i, _ubufs[_tp_id - i], _ubufs[_tp_id - i - 1]);
+        ncclGroupStart();
+        ncclSend(_ubufs[_tp_id - i].data_ptr(), sendcount, nccl_type, _next_rank, comm, _stream_comm.stream());
+        ncclRecv(_ubufs[_tp_id - i - 1].data_ptr(), sendcount, nccl_type, _prev_rank, comm, _stream_comm.stream());
+        ncclGroupEnd();
+      }
+
+    } else {
+      NVTE_ERROR("Not supported communication type.");
+    }
+
+    if (A_scale_inverse.numel())
+      A_scale_inverse = A_scale_inverse[A_fp8_tensor];
+
+    if (B_scale_inverse.numel())
+      B_scale_inverse = B_scale_inverse[B_fp8_tensor];
+
+    assert(pre_gelu_out.numel() == 0);
+    te_gemm(A, A_scale_inverse, A_type, transa, B, B_scale_inverse, B_type, transb, D, D_scale,
+            D_type, D_amax, bias, bias_type, pre_gelu_out, grad, workspace, workspaceSize,
+            accumulate, use_split_accumulator, _math_sms);
+
+    CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t)_stream_comm));
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_comm, 0));
+
+    if (_comm_type == COMM_TYPE::RS){      // Reduce GEMM output chunks
+      char *reduce_buf_ptr = reinterpret_cast<char *>(_ubufs[0].data_ptr());
+      if (_ubuf.element_size() == 1 && rs_output.element_size() == 2) {
+        assert(_ubuf_scale_inv_initialized);
+        char *rs_output_ptr = reinterpret_cast<char *>(_ubufs[_tp_size].data_ptr());
+        float *scale_inv_ptr = reinterpret_cast<float *>(_ubuf_scale_inv.data_ptr());
+        reduce_fp8_in_bf16_out<__nv_fp8_e4m3>(reduce_buf_ptr, rs_output_ptr, scale_inv_ptr,
+                                _tp_size, _ubufs[0].numel(), (cudaStream_t) stream_main);
+      } else {
+        torch::Tensor rs_output = torch::from_blob(
+          _ubufs[_tp_size].data_ptr(), {_ubufs[0].size(0), _ubufs[0].size(1)}, _ubuf.options());
+        torch::Tensor reduce_buf = torch::from_blob(
+          reduce_buf_ptr, {_tp_size, _ubufs[0].size(0), _ubufs[0].size(1)}, _ubuf.options());
+        torch::sum_out(rs_output, reduce_buf, 0);
+      }
+      return {D, rs_output};
+    }
+    else{
+      return {D, _ubuf};
+    }
+
+
+  }  // bulk_overlap
+
+
+
+torch::Tensor nccl_ubuf::NcclCommOverlap::split_overlap_ag_p2p(
   at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
   transformer_engine::DType A_type, bool transa,
   at::Tensor B, at::Tensor B_scale_inverse, int64_t B_fp8_tensor, 
@@ -128,7 +217,7 @@ torch::Tensor nccl_ubuf::NcclCommOverlap::split_overap_ag(
   const int m = (transa) ? A.size(0) : A.size(1);
   const int k = (transa) ? A.size(1) : A.size(0);
   const int n = (transb) ? B.size(1) : B.size(0);
-  const int n_chunk = (n * _tp_size) / _num_chunks;
+  const int n_chunk = _ubufs[0].size(0);
 
 
   // Get communication and GEMM output chunk sizes
@@ -154,12 +243,14 @@ torch::Tensor nccl_ubuf::NcclCommOverlap::split_overap_ag(
 
   printf(
     "m %d, n %d, k %d, n_chunk %d, _num_chunks %d comm_bytes %d element_size %d \n", \
-    m,n,k,n_chunk, _num_chunks, comm_bytes, B.element_size());
+    m,n,k,n_chunk, _num_chunks, comm_bytes, B.element_size(), do_gelu);
 
   // Catch up the default torch stream
   at::cuda::CUDAStream stream_main = at::cuda::getCurrentCUDAStream();
+  CHECK_CUDA(cudaEventRecord(_start_comm, (cudaStream_t)stream_main));
+  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_comm, 0));
   CHECK_CUDA(cudaEventRecord(_start_compute, (cudaStream_t)stream_main));
-  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_compute, 0));
+  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_compute[0], _start_compute, 0));
 
   for (int i=0; i<_num_chunks; i++){
     int send_chunk_id = (_tp_size + _tp_id - i) % _tp_size;
@@ -167,7 +258,8 @@ torch::Tensor nccl_ubuf::NcclCommOverlap::split_overap_ag(
     int send_offset = comm_bytes * send_chunk_id;
     int recv_offset = comm_bytes * recv_chunk_id;
 
-    printf("_tp_id %d i %d send_chunk_id %d recv_chunk_id %d\n", _tp_id, i, send_chunk_id, recv_chunk_id);
+    printf("_tp_id %d i %d send_chunk_id %d recv_chunk_id %d do_gelu %d\n", 
+        _tp_id, i, send_chunk_id, recv_chunk_id, do_gelu);
 
     if (i < _num_chunks - 1){
       ncclGroupStart();
@@ -183,10 +275,10 @@ torch::Tensor nccl_ubuf::NcclCommOverlap::split_overap_ag(
     // GEMM
     at::cuda::setCurrentCUDAStream(_stream_compute[i]);
 
+    printf("_tp_id %d i %d send_chunk_id %d output_chunk_bytes %d\n", _tp_id, i , send_chunk_id, output_chunk_bytes);
     torch::Tensor output_chunk = torch::from_blob(
       output_ptr + (send_chunk_id * output_chunk_bytes), {n_chunk, m}, D.options());
 
-    printf("inp %d %d %d\n", _tp_id, i , (send_chunk_id * output_chunk_bytes));
     torch::Tensor input_b_chunk = torch::from_blob(
       input_b_ptr + send_offset, {n_chunk, k}, B.options());
     torch::Tensor workspace_chunk =
@@ -224,7 +316,7 @@ torch::Tensor nccl_ubuf::NcclCommOverlap::split_overap_ag(
 /*
 ** Split ReduceScatter + GEMM using P2P communication
 */
-void nccl_ubuf::NcclCommOverlap::split_overlap_rs(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
+void nccl_ubuf::NcclCommOverlap::split_overlap_rs_p2p(at::Tensor A, at::Tensor A_scale_inverse, int64_t A_fp8_tensor,
                       transformer_engine::DType A_type, bool transa, at::Tensor B,
                       at::Tensor B_scale_inverse, int64_t B_fp8_tensor,
                       transformer_engine::DType B_type, bool transb, at::Tensor D,
@@ -235,11 +327,11 @@ void nccl_ubuf::NcclCommOverlap::split_overlap_rs(at::Tensor A, at::Tensor A_sca
                       at::Tensor rs_output) {
 
   ncclDataType_t nccl_type; 
-  if (A_type == transformer_engine::DType::kFloat32)
+  if (D_type == transformer_engine::DType::kFloat32)
     nccl_type = ncclFloat;
-  else if (A_type == transformer_engine::DType::kBFloat16)
+  else if (D_type == transformer_engine::DType::kBFloat16)
     nccl_type = ncclBfloat16;
-  else if (A_type == transformer_engine::DType::kFloat8E4M3)
+  else if (D_type == transformer_engine::DType::kFloat8E4M3)
     nccl_type = ncclUint8;
 
   int k = A.size(1);
@@ -250,9 +342,6 @@ void nccl_ubuf::NcclCommOverlap::split_overlap_rs(at::Tensor A, at::Tensor A_sca
   const int comm_count = _ubufs[0].numel();
   const int comm_bytes = _ubufs[0].numel() * _ubufs[0].element_size();
   const int input_b_chunk_bytes = n_chunk * k * B.element_size();
-
-  printf("input_b_chunk_bytes %d %d %d\n", input_b_chunk_bytes, n_chunk, k);
-  printf("_tp_id %d comm_bytes %d comm_count %d %d\n", _tp_id, comm_bytes, comm_count, nccl_type);
 
   // Get input and workspace data pointers
   char *input_b_ptr = reinterpret_cast<char *>(B.data_ptr());
@@ -265,16 +354,20 @@ void nccl_ubuf::NcclCommOverlap::split_overlap_rs(at::Tensor A, at::Tensor A_sca
   if (B_scale_inverse.numel())
     B_scale_inverse = B_scale_inverse[B_fp8_tensor];
 
-  // Catch up the main stream
   at::cuda::CUDAStream stream_main = at::cuda::getDefaultCUDAStream();
   CHECK_CUDA(cudaEventRecord(_start_compute, (cudaStream_t)stream_main));
   for (int i = 0; i < _stream_compute.size(); i++) {
       CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t) _stream_compute[i], _start_compute, 0));
   }
+  CHECK_CUDA(cudaEventRecord(_start_comm, (cudaStream_t)stream_main));
+  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_comm, 0));
+
+  printf("input_b_chunk_bytes %d %d %d\n", input_b_chunk_bytes, n_chunk, k);
+  printf("_tp_id %d comm_bytes %d comm_count %d %d\n", _tp_id, comm_bytes, comm_count, nccl_type);
+  printf("_stream_compute.size() %d tp_size %d\n", _stream_compute.size(), _tp_size);
 
   // GEMM and send/recv chunks
   for (int i = 0; i < _tp_size; i++) {
-    // GEMM chunk
     int input_b_chunk_id = (_tp_id + i + 1) % _tp_size;
     char* input_b_chunk_ptr = input_b_ptr + (input_b_chunk_id * input_b_chunk_bytes);
 
@@ -284,10 +377,12 @@ void nccl_ubuf::NcclCommOverlap::split_overlap_rs(at::Tensor A, at::Tensor A_sca
         workspace_ptr + (i % _stream_compute.size()) * workspace_size_chunk,
         {workspace_size_chunk}, workspace.options());
 
-    if (i >= 0) {
+    if (i > 0) {
+ 
       // P2P communication chunk
-      int send_rank = (_tp_id + i) % _tp_size;
-      int recv_rank = (_tp_size + _tp_id - i) % _tp_size;
+      int send_rank = (_tp_id + i) % _tp_size + _rank_round_tp;
+      int recv_rank = (_tp_size + _tp_id - i) % _tp_size + _rank_round_tp;
+
       CHECK_CUDA(cudaEventRecord(
           _start_comm, (cudaStream_t) _stream_compute[(i - 1) % _stream_compute.size()]));
       CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t) _stream_comm, _start_comm, 0));
@@ -298,21 +393,24 @@ void nccl_ubuf::NcclCommOverlap::split_overlap_rs(at::Tensor A, at::Tensor A_sca
       ncclGroupEnd();
     }
 
-
-    // if (i == _tp_size - 1)
-    //     at::cuda::setCurrentCUDAStream(stream_main);
-    // else
-    //     at::cuda::setCurrentCUDAStream(_stream_compute[i % _stream_compute.size()]);
-    at::cuda::setCurrentCUDAStream(stream_main);
-
+    at::cuda::setCurrentCUDAStream(_stream_compute[i % _stream_compute.size()]);
     te_gemm(A, A_scale_inverse, A_type, transa, input_b_chunk, B_scale_inverse, B_type, transb,
             _ubufs[i], D_scale, D_type, D_amax, bias, bias_type, pre_gelu_out, grad,
             workspace_chunk, workspace_size_chunk, accumulate, use_split_accumulator,
             _math_sms);
 
+
   }
-  CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t) _stream_comm));
-  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t) stream_main, _stop_comm, 0));
+
+  // all streams must finish before returning to Pytorch main stream
+  for (int i = 0; i < _stream_compute.size(); i++) {
+    CHECK_CUDA(
+        cudaEventRecord(_stop_compute, (cudaStream_t)_stream_compute[i]));
+    CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_compute, 0));
+  }
+  CHECK_CUDA(cudaEventRecord(_stop_comm, (cudaStream_t)_stream_comm));
+  CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)stream_main, _stop_comm, 0));
+  at::cuda::setCurrentCUDAStream(stream_main);
 
   // Reduce GEMM output chunks
   char *reduce_buf_ptr = reinterpret_cast<char *>(_ubufs[_tp_size - 1].data_ptr());
@@ -342,11 +440,11 @@ void nccl_ubuf::NcclCommOverlap::playground(
   bool accumulate, bool use_split_accumulator, at::Tensor B_copy)
 {  
   ncclDataType_t nccl_type; 
-  if (A_type == transformer_engine::DType::kFloat32)
+  if (D_type == transformer_engine::DType::kFloat32)
     nccl_type = ncclFloat;
-  else if (A_type == transformer_engine::DType::kBFloat16)
+  else if (D_type == transformer_engine::DType::kBFloat16)
     nccl_type = ncclBfloat16;
-  else if (A_type == transformer_engine::DType::kFloat8E4M3)
+  else if (D_type == transformer_engine::DType::kFloat8E4M3)
     nccl_type = ncclUint8;
 
   // Get GEMM comm_bytesensions between TN and NN input layouts

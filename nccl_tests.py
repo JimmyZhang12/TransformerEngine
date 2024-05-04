@@ -19,27 +19,98 @@ torch.cuda.set_device(rank)
 torch.distributed.init_process_group(backend='nccl', world_size=wsize, rank=rank)
 
 
+class BasicTEMLP(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
 
-def userbuffers():
-    fp8_dtype = tex.DType.kFloat8E4M3
-    recipe = transformer_engine.common.recipe.DelayedScaling(
-        fp8_format=transformer_engine.common.recipe.Format.E4M3,
-    )
-    with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
-        te.module.base.initialize_ub(
-            shape=[2048,4096],
+        activation_dtype = torch.bfloat16
+        tp_size = wsize
+        output_features = 8192
+        input_features = 8192
+        seqlen = 2048
+        tp_group = torch.distributed.new_group()
+
+        self.qkv = te.LayerNormLinear(
+            in_features=input_features, 
+            out_features=output_features, 
             tp_size=wsize,
-        )
-        module = te.Linear(
-            in_features=32, 
-            out_features=32, 
+            ub_overlap_ag=True,
+            ub_name='qkv',
+            tp_group=tp_group,
+            sequence_parallel=True,
+            bias=False,
+            parallel_mode='column',
+            params_dtype=activation_dtype   
+        ) 
+
+        self.proj = te.Linear(
+            in_features=input_features, 
+            out_features=output_features, 
             tp_size=wsize,
             ub_overlap_rs=True,
             ub_overlap_ag=True,
-            ub_name='proj')
-        module.set_tensor_parallel_group(torch.distributed.group.WORLD)
+            ub_name='proj',
+            tp_group=tp_group,
+            sequence_parallel=True,
+            bias=False,
+            parallel_mode='row',
+            params_dtype=activation_dtype   
+        ) 
 
-        _ = module(torch.zeros([8, 32], device="cuda"))
+
+    def forward(self, x):
+        x = self.qkv(x, is_first_microbatch=False)
+        x = self.proj(x, is_first_microbatch=False)
+        return x
+
+
+def userbuffers():
+        output_features = 8192
+        input_features = 8192
+        seqlen = 2048
+        tp_size = wsize
+        activation_dtype = torch.bfloat16
+
+
+        ub_cfgs = {
+            "qkv_fprop": {
+                'method': "ring_exchange",
+                'use_nccl': True,
+                'use_nccl_userbuffer': False,
+                'fp8_buf': True,
+            },
+            "proj_fprop": {
+                'method': "ring_exchange",
+                'use_nccl': True,
+                'use_nccl_userbuffer': False,
+                'fp8_buf': True,
+            }
+        }
+        
+        te.module.base.initialize_ub(
+            shape=[seqlen,output_features],
+            tp_size=tp_size,
+            ub_cfgs=ub_cfgs,
+            use_fp8=True,
+            dtype=activation_dtype,
+        )
+
+
+        num_modules = 16
+        modules = []
+        with te.fp8_model_init(enabled=True):
+            for _ in range(num_modules):
+                modules.append(BasicTEMLP())
+
+        recipe = transformer_engine.common.recipe.DelayedScaling(
+            fp8_format=transformer_engine.common.recipe.Format.E4M3,
+        )
+        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            x = torch.zeros([seqlen//tp_size, input_features], dtype=activation_dtype, device=torch.cuda.current_device())
+
+            for mlp in modules:
+                x = mlp(x)
+
 
 def test_baseline_ag_gemm(torch_dtype):
     input_features = 8192
@@ -241,10 +312,13 @@ def test_rs(
     debug_print=False
 
     iters = 5
+
+    test_a = torch.zeros([32768, 32768], dtype=torch.float).cuda()
+    test_b = torch.zeros([32768, 32768], dtype=torch.float).cuda()
+
     for i in range(iters):
-        # if i == 1:
-        #     torch.cuda.synchronize()
-        #     tic = time.time()
+        c = torch.add(test_a, test_b)
+
         out = nccl_gemm_overlap.split_overlap_rs(
             A, A_scale_inverse,  A_fp8_tensor,
             A_type, transa,
@@ -254,7 +328,6 @@ def test_rs(
             D_amax, bias, bias_type,
             pre_gelu_out, grad, workspace, workspaceSize,
             accumulate, use_split_accumulator, rs_output)
-        torch.cuda.synchronize()
 
 
 def playground(
@@ -344,13 +417,16 @@ if __name__ == "__main__":
     #     cpsize = 2,
     #     torch_dtype = torch.bfloat16)
 
-    test_rs(
-        input_features = 8192,
-        output_features = 8192, #FFN1 chunks gate plus fc1
-        sequence_len = 4096,
-        tpsize = 2,
-        cpsize = 2,
-        torch_dtype = torch.uint8)
+    userbuffers()
+
+    # test_rs(
+    #     input_features = 8192,
+    #     output_features = 8192, #FFN1 chunks gate plus fc1
+    #     sequence_len = 4096,
+    #     tpsize = 2,
+    #     cpsize = 2,
+    #     torch_dtype = torch.uint8)
+
 
     # test_ag(
     #     input_features = 8192,

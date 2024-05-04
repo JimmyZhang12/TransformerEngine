@@ -114,7 +114,11 @@ def initialize_ub(
         aggregate: int = 0,
         atomic_gemm: int = 0,
         fp8_buf: bool = False,
+        use_nccl: bool = False,
+        use_nccl_userbuffer: bool = False,
     ) -> None:
+        print(use_nccl, name, is_reduce_scatter, fp8_buf)
+
         if atomic_gemm:
             warnings.warn(
                 "Atomic GEMM uses a beta API from cublas and is not tested for all use cases."
@@ -154,24 +158,35 @@ def initialize_ub(
             dtype=torch.uint8 if (use_fp8 and fp8_buf) else dtype,
             device='cuda')
         if method == 'ring_exchange':
-            ub_obj = tex.UbufP2PCommOverlap(
-                    sample_buffer,          # Sample userbuffer
-                    rank_id,                # Rank id
-                    tp_size,                # TP size
-                    num_sm,                 # Number of communication SMs
-                    cga_size,               # CGA cluster size
-                    bool(set_sm_margin),          # Set SM margin
-                    bool(aggregate),              # Aggregate 2X GEMM chunks
-                    _NUM_MAX_UB_STREAMS,    # Max concurrent GEMM streams
-                    bool(is_reduce_scatter),      # overlap with reduce scatter
-                    bool(atomic_gemm),            # use a single GEMM with atomic-counters
-                    torch.Tensor(),         # empty tensor to pass to counters
-                )
-#   UbufP2PCommOverlap(torch::Tensor sample, int rank, int tp_size, int num_comm_sm,
-#                      int comm_cga_size, bool set_sm_margin, bool aggregate2, int num_max_streams,
-#                      bool is_reduce_scatter, bool atomic_gemm, torch::Tensor empty_tensor)
-
+            if use_nccl:
+                ub_obj = tex.NcclCommOverlap(
+                        sample_buffer,          # Sample userbuffer
+                        rank_id,                # Rank id
+                        tp_size,                # TP size
+                        num_sm,                 # Number of communication SMs
+                        _NUM_MAX_UB_STREAMS,    # Max concurrent GEMM streams
+                        bool(set_sm_margin),          # Set SM margin
+                        bool(aggregate),              # Aggregate 2X GEMM chunks
+                        bool(is_reduce_scatter),      # overlap with reduce scatter
+                        bool(atomic_gemm),            # use a single GEMM with atomic-counters
+                        bool(use_nccl_userbuffer)
+                    )                
+            else:
+                ub_obj = tex.UbufP2PCommOverlap(
+                        sample_buffer,          # Sample userbuffer
+                        rank_id,                # Rank id
+                        tp_size,                # TP size
+                        num_sm,                 # Number of communication SMs
+                        cga_size,               # CGA cluster size
+                        bool(set_sm_margin),          # Set SM margin
+                        bool(aggregate),              # Aggregate 2X GEMM chunks
+                        _NUM_MAX_UB_STREAMS,    # Max concurrent GEMM streams
+                        bool(is_reduce_scatter),      # overlap with reduce scatter
+                        bool(atomic_gemm),            # use a single GEMM with atomic-counters
+                        torch.Tensor(),         # empty tensor to pass to counters
+                    )
         else:
+            return
             ub_obj = tex.UbufCommOverlap(
                     sample_buffer,          # Sample userbuffer
                     rank_id,                # Rank id
@@ -184,11 +199,6 @@ def initialize_ub(
                     atomic_gemm,            # use a single GEMM with atomic-counters
                     torch.Tensor(),         # empty tensor to pass to counters
                 )
-
-#   UbufCommOverlap(torch::Tensor sample, int rank, int tp_size, int num_comm_sm, int comm_cga_size,
-#                   int num_splits, bool set_sm_margin, int num_max_streams, bool atomic_gemm,
-#                   torch::Tensor empty_tensor) {
-
         _ub_communicators[name] = ub_obj
 
     if ub_cfgs is not None:
@@ -213,6 +223,9 @@ def initialize_ub(
             # Support FP8 userbuffer when (1) AllGather and (2) FP8-GEMM output ReduceScatter
             fp8_buf = ((name in layers_all_gather_overlap) or
                       (ub_cfg.get("fp8_buf", False) and name in methods["pipeline"]))
+            use_nccl = ub_cfg.get("use_nccl", 0)
+            use_nccl_userbuffer = ub_cfg.get("use_nccl_userbuffer", 0)
+
             add_ub(
                 name,
                 method,
@@ -224,16 +237,18 @@ def initialize_ub(
                 aggregate,
                 atomic_gemm,
                 fp8_buf,
+                use_nccl,
+                use_nccl_userbuffer,
             )
-        else:
-            method = get_method(name)
-            add_ub(
-                name,
-                method=method,
-                is_reduce_scatter=1 if name in layers_reduce_scatter_overlap else 0,
-                num_splits=4 if method == "pipeline" else 0,
-                fp8_buf=name in layers_all_gather_overlap,
-            )
+        # else:
+        #     method = get_method(name)
+        #     add_ub(
+        #         name,
+        #         method=method,
+        #         is_reduce_scatter=1 if name in layers_reduce_scatter_overlap else 0,
+        #         num_splits=4 if method == "pipeline" else 0,
+        #         fp8_buf=name in layers_all_gather_overlap,
+        #     )
 
 
 def get_ub(name: str):
