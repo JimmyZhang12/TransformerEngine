@@ -591,7 +591,7 @@ def make_graphed_callables(
     forward_funcs = []
     for module in modules:
         assert isinstance(module, torch.nn.Module), f"Graphing for {type(module)} is not supported."
-        wrap_autocast(module)
+        # wrap_autocast(module)
         forward_funcs.append(module)
 
     if just_one_callable:
@@ -603,7 +603,7 @@ def make_graphed_callables(
     if graph_safe_rng_available():
         generators = [
             torch.cuda.default_generators[torch.cuda.current_device()],
-            *get_all_rng_states().values(),
+            # *get_all_rng_states().values(),
         ]
         original_rng_states = [state.get_state() for state in generators]
     else:
